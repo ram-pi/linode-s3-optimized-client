@@ -1,8 +1,6 @@
 # S3 Optimized Client
 
-Fast parallel downloader for S3-compatible object storage (Linode Object Storage).
-Resolves the endpoint to all public IPs, opens one TCP/TLS connection per IP,
-and downloads byte ranges in parallel with keep-alive connection pooling.
+A fast parallel downloader for S3-compatible object storage, built for Linode Object Storage. It maximizes download throughput by using every IP the endpoint resolves to — each IP gets its own TCP/TLS connection, and each object is split into byte ranges fetched concurrently across all of them.
 
 ## Prerequisites
 
@@ -101,6 +99,7 @@ docker run --rm \
 --concurrency N          Parallel objects for --prefix/--all (default: number of IPs)
 --min-chunk-mb N         Minimum chunk size in MiB for auto chunking (default: 2)
 --dns-only               Resolve endpoint to IPs and exit
+--ipv6                   Include IPv6 addresses (default: IPv4 only)
 --no-verify-tls          Disable TLS certificate verification (insecure)
 -v / -vv                 Increase logging verbosity
 ```

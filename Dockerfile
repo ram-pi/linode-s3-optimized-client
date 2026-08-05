@@ -48,11 +48,35 @@ RUN groupadd --system --gid 1001 app \
 # Copy the venv from the builder.
 COPY --from=builder --chown=app:app /opt/venv /opt/venv
 
-USER app
 WORKDIR /home/app
 
 # Default download directory (writable by the non-root user).
 RUN mkdir -p /home/app/downloads
 
-ENTRYPOINT ["python", "-m", "s3_optimized_client"]
+# Entrypoint: as root, chown mounted volumes so the non-root user can write,
+# then exec the tool as user "app" using runuser (preserves args correctly).
+COPY <<'EOF' /usr/local/bin/entrypoint.sh
+#!/bin/sh
+set -e
+
+# Chown common output mount points so the non-root "app" user can write.
+for dir in /tmp/downloads /home/app/downloads /data /output; do
+    [ -d "$dir" ] && chown -R app:app "$dir" 2>/dev/null || true
+done
+
+# Parse --output / -o from args and chown its parent directory.
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "--output" ] || [ "$prev" = "-o" ]; then
+        parent=$(dirname "$arg")
+        [ -d "$parent" ] && chown -R app:app "$parent" 2>/dev/null || true
+    fi
+    prev="$arg"
+done
+
+exec runuser -u app -- python -m s3_optimized_client "$@"
+EOF
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["--help"]

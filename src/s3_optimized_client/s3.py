@@ -247,7 +247,7 @@ class S3Client:
         signed = self._signer.sign(method, url, base_headers)
 
         last_exc: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(3):
             conn = self._checkout(bucket, ip) if attempt == 0 else self._new_conn(ip, bucket)
             try:
                 conn.request(method, f"/{key.lstrip('/')}", headers=signed)
@@ -257,8 +257,8 @@ class S3Client:
                 last_exc = exc
                 with suppress(OSError):
                     conn.close()
-                if attempt == 0:
-                    log.debug("request to %s failed (%s), retrying with fresh conn", ip, exc)
+                if attempt < 2:
+                    log.debug("request to %s failed (%s), retry %d", ip, exc, attempt + 1)
                     continue
                 break
         assert last_exc is not None

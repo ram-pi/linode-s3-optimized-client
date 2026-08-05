@@ -114,6 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Debug
+    p.add_argument(
+        "--ipv6",
+        action="store_true",
+        help="Use IPv6 addresses in addition to IPv4 (default: IPv4 only)",
+    )
     p.add_argument("--dns-only", action="store_true", help="Resolve endpoint to IPs and exit")
     p.add_argument("-v", "--verbose", action="count", default=0, help="Increase logging (-v, -vv)")
     return p
@@ -159,13 +164,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    # Resolve endpoint to IPs.
+    # Resolve endpoint to IPs. Default to IPv4 only — Docker and many
+    # networks don't route IPv6, and unreachable IPv6 IPs cause permanent
+    # chunk failures. Use --ipv6 to include AAAA records.
     try:
         resolved = resolve_endpoint(args.endpoint)
     except Exception as exc:  # noqa: BLE001
         log.error("failed to resolve %s: %s", args.endpoint, exc)
         return 1
-    ips = [r.ip for r in resolved]
+    if args.ipv6:
+        ips = [r.ip for r in resolved]
+    else:
+        ips = [r.ip for r in resolved if not r.is_ipv6]
+        if not ips:
+            # No IPv4 records — fall back to whatever we have.
+            ips = [r.ip for r in resolved]
     log.info("resolved %s -> %d IPs: %s", args.endpoint, len(ips), ", ".join(ips))
 
     creds = S3Credentials(
