@@ -97,6 +97,7 @@ docker run --rm \
 --output PATH            Output file (--key) or directory (--prefix/--all)
 --chunks N               Override byte-range chunk count (auto by default)
 --concurrency N          Parallel objects for --prefix/--all (default: number of IPs)
+--connections-per-ip N   Concurrent TCP connections per IP (default: 4)
 --min-chunk-mb N         Minimum chunk size in MiB for auto chunking (default: 2)
 --dns-only               Resolve endpoint to IPs and exit
 --ipv6                   Include IPv6 addresses (default: IPv4 only)

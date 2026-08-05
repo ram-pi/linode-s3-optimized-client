@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 DEFAULT_MIN_CHUNK_MB = 2
-MAX_CHUNKS_PER_IP = 32  # cap to avoid excessive overhead on huge files
+MAX_CHUNKS_PER_IP = 64  # cap to avoid excessive overhead on huge files
 
 
 @dataclass(frozen=True, slots=True)

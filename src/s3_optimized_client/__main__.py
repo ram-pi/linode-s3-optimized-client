@@ -112,6 +112,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Parallel objects for --prefix/--all (default: number of resolved IPs)",
     )
+    p.add_argument(
+        "--connections-per-ip",
+        type=int,
+        default=4,
+        help="Concurrent TCP connections per IP for range downloads (default: 4)",
+    )
 
     # Debug
     p.add_argument(
@@ -200,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             min_chunk_mb=args.min_chunk_mb,
             object_concurrency=args.concurrency,
             verify_tls=not args.no_verify_tls,
+            connections_per_ip=args.connections_per_ip,
         )
 
         try:
