@@ -344,6 +344,40 @@ class S3Client:
                 resp.close()
             self._checkin(bucket, ip, conn)
 
+    def get_object(
+        self,
+        bucket: str,
+        key: str,
+        ip: str,
+    ) -> Iterator[bytes]:
+        """Stream the full object body from *ip* (no Range header).
+
+        Simpler than :meth:`range_get` — used by the persistent worker
+        processes for prefix/bucket downloads where each process downloads
+        full objects sequentially. The connection is returned to the pool
+        after the body is fully consumed.
+        """
+        status, _headers, resp, conn = self._request("GET", bucket, key, ip)
+        if status != 200:
+            body = resp.read(2048)
+            with suppress(OSError):
+                resp.close()
+            with suppress(OSError):
+                conn.close()
+            msg = f"GET {bucket}/{key} failed: HTTP {status}: {body[:200]!r}"
+            raise RuntimeError(msg)
+
+        try:
+            while True:
+                chunk = resp.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            with suppress(OSError):
+                resp.close()
+            self._checkin(bucket, ip, conn)
+
     def list_objects(
         self,
         bucket: str,

@@ -1,14 +1,13 @@
-"""Parallel byte-range downloader using persistent multiprocessing.
+"""Parallel downloader using persistent multiprocessing.
 
-For single-object downloads: uses threads (process overhead isn't worth it
-for one object).
+For single-object downloads: uses threads with byte-range parallelism across
+all IPs (process overhead isn't worth it for one object).
 
-For prefix/bucket downloads: spawns **persistent worker processes** — one per
-resolved IP — at startup. Each worker creates a single ``S3Client`` pinned to
-its IP and reuses keep-alive connections across all objects. Within each
-object, ranges are downloaded concurrently using a thread pool sized by
-``connections_per_ip`` — multiple concurrent TCP connections per IP is what
-breaks through the single-connection throughput ceiling (~70 MiB/s → 250+).
+For prefix/bucket downloads: spawns **persistent worker processes** —
+``connections_per_ip`` processes per resolved IP. Each process is
+single-threaded with its own GIL and its own TCP connection, downloading full
+objects sequentially. No GIL contention, no range splitting, no reassembly.
+Scales linearly with ``connections_per_ip`` until the VM NIC or CPU is saturated.
 """
 
 from __future__ import annotations
@@ -43,7 +42,7 @@ class DownloadResult:
 
 
 # ---------------------------------------------------------------------------
-# Persistent worker process (one per IP, lives for the entire prefix download).
+# Persistent worker process (single-threaded, downloads full objects).
 # ---------------------------------------------------------------------------
 
 
@@ -57,24 +56,20 @@ def _persistent_worker(
     endpoint: str,
     creds: S3Credentials,
     verify_tls: bool,
-    chunks_override: int | None,
-    min_chunk_mb: int,
-    connections_per_ip: int,
 ) -> None:
-    """Worker process: downloads objects from *task_queue* using *ip* only.
+    """Worker process: downloads full objects from *task_queue* using *ip*.
 
-    Creates one ``S3Client`` at startup (with a connection pool sized to
-    *connections_per_ip*) and reuses it for all objects. Within each object,
-    byte ranges are downloaded concurrently using *connections_per_ip* threads
-    — each thread checks out a separate keep-alive connection, so multiple TCP
-    connections are in flight simultaneously per IP.
+    Single-threaded — no GIL contention with other connections on the same IP.
+    Creates one ``S3Client`` at startup and reuses keep-alive connections.
+    Downloads full objects (no Range header, no chunk splitting) and writes
+    them sequentially to disk via ``os.write``.
+
+    Multiple processes for the same IP read from the same task queue — each
+    gets a different object, so all connections are busy simultaneously.
 
     Runs until it receives ``None`` on the task queue (sentinel).
     """
-    client = S3Client(
-        endpoint, creds, [ip], verify_tls=verify_tls, pool_size_per_ip=connections_per_ip
-    )
-    all_ips = [ip]  # this worker only uses its own IP
+    client = S3Client(endpoint, creds, [ip], verify_tls=verify_tls, pool_size_per_ip=1)
     try:
         while True:
             task = task_queue.get()
@@ -89,68 +84,21 @@ def _persistent_worker(
                     result_queue.put((key, True, None))
                     continue
 
-                # Plan ranges across this single IP. Aim for exactly
-                # connections_per_ip ranges so all threads download in a single
-                # round (no sequential rounds) — minimizes HTTP overhead.
-                ranges = plan_chunks(
-                    obj_size,
-                    all_ips,
-                    chunks_override=chunks_override,
-                    min_chunk_mb=min_chunk_mb,
-                    target_chunks=connections_per_ip,
-                )
-
                 fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
                 try:
-                    os.ftruncate(fd, obj_size)
-
-                    # Download ranges concurrently — each thread checks out a
-                    # separate connection from the keep-alive pool.
-                    range_errors: list[str] = []
-                    range_err_lock = threading.Lock()
-
-                    def _range_worker(
-                        rng: Range,
-                        _bucket: str = bucket,
-                        _key: str = key,
-                        _fd: int = fd,
-                        _ip: str = ip,
-                        _ip_idx: int = ip_index,
-                        _err_lock: threading.Lock = range_err_lock,
-                        _errors: list = range_errors,  # noqa: B008
-                    ) -> None:
-                        try:
-                            offset = rng.start
-                            for buf in client.range_get(_bucket, _key, rng.start, rng.end, _ip):
-                                view = memoryview(buf)
-                                written = 0
-                                while written < len(buf):
-                                    n = os.pwrite(_fd, view[written:], offset + written)
-                                    written += n
-                                offset += len(buf)
-                                with shared_bytes.get_lock():
-                                    shared_bytes[_ip_idx] += len(buf)
-                        except Exception as exc:  # noqa: BLE001
-                            with _err_lock:
-                                _errors.append(f"range {rng.index}: {exc}")
-                            log.exception("range %d failed on %s", rng.index, _ip)
-
-                    n_workers = min(len(ranges), connections_per_ip)
-                    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                        futures = [pool.submit(_range_worker, r) for r in ranges]
-                        for fut in as_completed(futures):
-                            fut.result()
-
+                    for buf in client.get_object(bucket, key, ip):
+                        view = memoryview(buf)
+                        written = 0
+                        while written < len(buf):
+                            n = os.write(fd, view[written:])
+                            written += n
+                        with shared_bytes.get_lock():
+                            shared_bytes[ip_index] += len(buf)
                     with shared_chunks.get_lock():
-                        shared_chunks[ip_index] += len(ranges)
-                    # No per-object fsync — let the kernel flush asynchronously.
-                    # fsync stalls the write path at high throughput.
+                        shared_chunks[ip_index] += 1
                 finally:
                     os.close(fd)
-                if range_errors:
-                    result_queue.put((key, False, "; ".join(range_errors)))
-                else:
-                    result_queue.put((key, True, None))
+                result_queue.put((key, True, None))
             except Exception as exc:  # noqa: BLE001
                 log.exception("worker %s: object %s failed", ip, key)
                 with shared_bytes.get_lock():
@@ -168,9 +116,13 @@ def _persistent_worker(
 class ParallelDownloader:
     """Orchestrates parallel downloads across resolved IPs.
 
-    Single-object: threads (low overhead, GIL impact is small for one object).
-    Prefix/bucket: persistent processes (one per IP) with concurrent range
-    threads inside each process (``connections_per_ip`` TCP connections per IP).
+    Single-object: threads with byte-range parallelism (low overhead for one
+    object, GIL impact is small).
+
+    Prefix/bucket: ``connections_per_ip`` persistent processes per IP, each
+    single-threaded with its own GIL and TCP connection. Scales linearly with
+    ``connections_per_ip`` — no GIL contention between connections on the same
+    IP.
     """
 
     def __init__(
@@ -179,7 +131,7 @@ class ParallelDownloader:
         ips: list[str],
         *,
         chunks_override: int | None = None,
-        min_chunk_mb: int = 2,
+        min_chunk_mb: int = 4,
         object_concurrency: int | None = None,
         verify_tls: bool = True,
         connections_per_ip: int = 4,
@@ -193,7 +145,7 @@ class ParallelDownloader:
         self._connections_per_ip = max(1, connections_per_ip)
         self._mp_ctx = multiprocessing.get_context("fork")
 
-    # -- Single object (threads) ------------------------------------------
+    # -- Single object (threads + ranges) ---------------------------------
 
     def download_object(
         self,
@@ -203,7 +155,12 @@ class ParallelDownloader:
         *,
         tracker: ProgressTracker | None = None,
     ) -> DownloadResult:
-        """Download *bucket*/*key* to *output_path* using parallel threads."""
+        """Download *bucket*/*key* to *output_path* using parallel threads.
+
+        Uses threads with byte-range parallelism across all IPs. For a single
+        object the GIL impact is small and process spawning overhead isn't
+        worth it.
+        """
         start = time.monotonic()
         meta = self._client.head_object(bucket, key, ip=self._ips[0])
         total = meta.size
@@ -280,7 +237,7 @@ class ParallelDownloader:
             error="; ".join(errors) if errors else None,
         )
 
-    # -- Prefix / bucket (persistent processes) ----------------------------
+    # -- Prefix / bucket (persistent processes, no GIL contention) -------
 
     def download_prefix(
         self,
@@ -290,11 +247,11 @@ class ParallelDownloader:
     ) -> list[DownloadResult]:
         """Download all objects under *prefix* into *output_dir*.
 
-        Spawns one persistent process per IP. Objects are distributed
-        round-robin to the workers via queues. Each worker uses
-        ``connections_per_ip`` concurrent threads for range downloads within
-        each object — multiple TCP connections per IP is what breaks through
-        the single-connection throughput ceiling.
+        Spawns ``connections_per_ip`` persistent processes per IP. Each process
+        is single-threaded with its own GIL and TCP connection, downloading
+        full objects sequentially. Multiple processes for the same IP read
+        from the same task queue — each gets a different object, so all
+        connections stay busy. No GIL contention, no range splitting.
         """
         results: list[DownloadResult] = []
         metas = list(self._client.list_objects(bucket, prefix=prefix))
@@ -302,8 +259,7 @@ class ParallelDownloader:
             log.warning("no objects found under prefix %r in bucket %r", prefix, bucket)
             return results
 
-        # Pre-create all output directories in the main process (avoids per-
-        # object mkdir contention in workers).
+        # Pre-create all output directories in the main process.
         for meta in metas:
             rel = _relative_key(meta.key, prefix)
             out = output_dir / rel
@@ -311,16 +267,19 @@ class ParallelDownloader:
 
         total_bytes = sum(m.size for m in metas)
         n_ips = len(self._ips)
+        cpi = self._connections_per_ip
         tracker = ProgressTracker(
             total_bytes, ip_label=f"{bucket}: {len(metas)} objects", show_live=True
         )
         tracker.start()
 
-        # Shared memory counters.
+        # Shared memory counters — one slot per IP (shared by all processes
+        # for that IP).
         shared_bytes = self._mp_ctx.Array("q", n_ips)
         shared_chunks = self._mp_ctx.Array("i", n_ips)
 
-        # One task queue per IP (round-robin distribution), one shared result queue.
+        # One task queue per IP. Multiple consumer processes per IP read from
+        # the same queue — multiprocessing.Queue is safe for multiple consumers.
         task_queues = [self._mp_ctx.Queue() for _ in range(n_ips)]
         result_queue = self._mp_ctx.Queue()
         creds = self._client._creds  # noqa: SLF001
@@ -332,32 +291,31 @@ class ParallelDownloader:
             out = output_dir / rel
             task_queues[ip_idx].put((bucket, meta.key, str(out), meta.size))
 
-        # Send a sentinel (None) to each worker to signal completion.
+        # Send connections_per_ip sentinels per IP (one per consumer process).
         for q in task_queues:
-            q.put(None)
+            for _ in range(cpi):
+                q.put(None)
 
-        # Spawn persistent worker processes.
+        # Spawn connections_per_ip processes per IP.
         workers = []
         for i, ip in enumerate(self._ips):
-            p = self._mp_ctx.Process(
-                target=_persistent_worker,
-                args=(
-                    ip,
-                    task_queues[i],
-                    result_queue,
-                    shared_bytes,
-                    shared_chunks,
-                    i,
-                    self._client.endpoint,
-                    creds,
-                    self._verify_tls,
-                    self._chunks_override,
-                    self._min_chunk_mb,
-                    self._connections_per_ip,
-                ),
-            )
-            workers.append(p)
-            p.start()
+            for _ in range(cpi):
+                p = self._mp_ctx.Process(
+                    target=_persistent_worker,
+                    args=(
+                        ip,
+                        task_queues[i],
+                        result_queue,
+                        shared_bytes,
+                        shared_chunks,
+                        i,
+                        self._client.endpoint,
+                        creds,
+                        self._verify_tls,
+                    ),
+                )
+                workers.append(p)
+                p.start()
 
         # Polling thread: read shared counters and update the progress tracker.
         stop_event = threading.Event()
