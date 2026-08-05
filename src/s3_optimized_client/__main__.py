@@ -103,8 +103,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-chunk-mb",
         type=int,
-        default=2,
-        help="Minimum chunk size in MiB for auto chunking (default: 2)",
+        default=4,
+        help="Minimum chunk size in MiB for auto chunking (default: 4)",
     )
     p.add_argument(
         "--concurrency",

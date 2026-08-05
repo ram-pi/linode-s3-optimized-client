@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-DEFAULT_MIN_CHUNK_MB = 2
+DEFAULT_MIN_CHUNK_MB = 4
 MAX_CHUNKS_PER_IP = 64  # cap to avoid excessive overhead on huge files
 
 
@@ -32,6 +32,7 @@ def plan_chunks(
     *,
     chunks_override: int | None = None,
     min_chunk_mb: int = DEFAULT_MIN_CHUNK_MB,
+    target_chunks: int | None = None,
 ) -> list[Range]:
     """Plan byte ranges to download *total_size* bytes across *ips*.
 
@@ -41,6 +42,11 @@ def plan_chunks(
         chunks_override: if set, use exactly this many chunks (clamped to
             ``[1, total_size]``); otherwise auto-compute.
         min_chunk_mb: minimum chunk size (MiB) for auto-computing chunk count.
+        target_chunks: if set, aim for exactly this many chunks so all
+            download threads are used in a single round (no sequential rounds).
+            The actual count is clamped by ``min_chunk_mb`` (won't make chunks
+            smaller than the minimum) and by ``total_size``. When the object is
+            large enough, this produces exactly ``target_chunks`` ranges.
 
     Returns:
         Ordered list of :class:`Range` with ``ip`` assigned round-robin.
@@ -59,6 +65,13 @@ def plan_chunks(
 
     if chunks_override is not None:
         n = max(1, min(chunks_override, total_size))
+    elif target_chunks is not None:
+        # Aim for exactly target_chunks ranges so all threads download in a
+        # single round. Shrink if chunks would be smaller than min_chunk.
+        n = max(1, target_chunks)
+        while n > 1 and _ceil_div(total_size, n) < min_chunk_bytes:
+            n -= 1
+        n = max(1, min(n, total_size))
     else:
         # Auto: at least one chunk per IP, but cap each chunk at >= min_chunk.
         # Start with len(ips) chunks; if any chunk < min_chunk, reduce count.

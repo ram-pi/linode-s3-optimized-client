@@ -89,13 +89,15 @@ def _persistent_worker(
                     result_queue.put((key, True, None))
                     continue
 
-                # Plan ranges across this single IP. With connections_per_ip
-                # threads, we want at least that many ranges for full parallelism.
+                # Plan ranges across this single IP. Aim for exactly
+                # connections_per_ip ranges so all threads download in a single
+                # round (no sequential rounds) — minimizes HTTP overhead.
                 ranges = plan_chunks(
                     obj_size,
                     all_ips,
                     chunks_override=chunks_override,
                     min_chunk_mb=min_chunk_mb,
+                    target_chunks=connections_per_ip,
                 )
 
                 fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -216,6 +218,7 @@ class ParallelDownloader:
             self._ips,
             chunks_override=self._chunks_override,
             min_chunk_mb=self._min_chunk_mb,
+            target_chunks=self._connections_per_ip * len(self._ips),
         )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
