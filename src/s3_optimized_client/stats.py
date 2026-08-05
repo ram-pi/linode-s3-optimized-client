@@ -112,6 +112,19 @@ class ProgressTracker:
         else:
             self._maybe_print_progress()
 
+    def advance(self, n: int) -> None:
+        """Advance the total downloaded counter by *n* bytes (no per-IP breakdown).
+
+        Used by the multiprocessing polling thread that reads shared counters
+        and doesn't have per-chunk IP information.
+        """
+        with self._lock:
+            self._downloaded += n
+        if self._show_live and self._progress is not None:
+            self._progress.update(self._task, advance=n)
+        else:
+            self._maybe_print_progress()
+
     def _maybe_print_progress(self) -> None:
         """Print a progress line every ~2s when no live bar is active."""
         now = time.monotonic()
@@ -168,6 +181,44 @@ class ProgressTracker:
             total_bytes = self._downloaded
             per_ip = dict(self._per_ip)
 
+        self._print_table(title, elapsed, object_label, total_bytes, per_ip)
+
+    def print_summary_from_shared(
+        self,
+        *,
+        title: str = "Download summary",
+        elapsed: float | None = None,
+        object_label: str | None = None,
+        ip_bytes: dict[str, int] | None = None,
+        ip_chunks: dict[str, int] | None = None,
+    ) -> None:
+        """Print summary from per-IP data collected from shared memory.
+
+        Used in multiprocessing mode where the tracker doesn't have live
+        per-IP stats (workers update shared arrays, not the tracker).
+        """
+        elapsed = elapsed if elapsed is not None else (time.monotonic() - self._start)
+        with self._lock:
+            total_bytes = self._downloaded
+        per_ip: dict[str, IPStats] = {}
+        if ip_bytes:
+            for ip, n in ip_bytes.items():
+                per_ip[ip] = IPStats(
+                    bytes_downloaded=n,
+                    chunks=(ip_chunks or {}).get(ip, 0),
+                    elapsed=elapsed,
+                )
+        self._print_table(title, elapsed, object_label, total_bytes, per_ip)
+
+    def _print_table(
+        self,
+        title: str,
+        elapsed: float,
+        object_label: str | None,
+        total_bytes: int,
+        per_ip: dict[str, IPStats],
+    ) -> None:
+        """Internal: render the summary table + aggregate stats."""
         table = Table(title=title, show_header=True, header_style="bold green")
         table.add_column("IP", style="cyan", no_wrap=True)
         table.add_column("Chunks", justify="right")

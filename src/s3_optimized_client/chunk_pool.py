@@ -89,3 +89,15 @@ def plan_chunks(
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
+
+
+def group_ranges_by_ip(ranges: list[Range]) -> dict[str, list[Range]]:
+    """Group a list of :class:`Range` objects into a dict keyed by IP.
+
+    Each entry contains the ranges assigned to that IP, in order. Used to
+    distribute work to one process per IP.
+    """
+    groups: dict[str, list[Range]] = {}
+    for rng in ranges:
+        groups.setdefault(rng.ip, []).append(rng)
+    return groups

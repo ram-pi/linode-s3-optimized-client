@@ -335,7 +335,7 @@ class S3Client:
         # Stream the body, then return the connection to the pool for reuse.
         try:
             while True:
-                chunk = resp.read(256 * 1024)
+                chunk = resp.read(4 * 1024 * 1024)
                 if not chunk:
                     break
                 yield chunk
