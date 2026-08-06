@@ -2,17 +2,14 @@
 
 Design
 ------
-* Metadata (``HEAD`` to get object size) and bulk transfer (``Range`` GETs) go
-  through a custom :class:`ForcedIPHTTPSConnection` that dials a *specific*
-  resolved IP while keeping TLS SNI / certificate verification pinned to the
-  virtual-host hostname (``<bucket>.<endpoint>``). This is what lets us open one
-  TCP connection per public IP returned by the DNS lookup.
-* Connections are pooled per (IP, bucket) and reused across range requests via
-  keep-alive — TLS handshakes are expensive (~100-200 ms each) and re-handshaking
-  per chunk dominated transfer time in early benchmarks.
-* ``LIST`` (used for prefix / whole-bucket downloads) is low-volume and goes
-  through ``boto3`` against the virtual-host endpoint; the heavy lifting (range
-  GETs) still uses the forced-IP connections.
+* All requests go through a custom :class:`ForcedIPHTTPSConnection` that dials
+  a *specific* resolved IP while keeping TLS SNI / certificate verification
+  pinned to the virtual-host hostname (``<bucket>.<endpoint>``). This is what
+  lets us open one TCP connection per public IP returned by the DNS lookup.
+* Connections are pooled per (IP, bucket) and reused across requests via
+  keep-alive — TLS handshakes are expensive (~100-200 ms each).
+* ``LIST`` (used for prefix / whole-bucket downloads) goes through ``boto3``
+  against the virtual-host endpoint.
 * Signing uses ``botocore.auth.S3SigV4Auth`` so we stay wire-compatible with
   AWS S3 / Linode Object Storage without re-implementing SigV4.
 
@@ -291,54 +288,6 @@ class S3Client:
             # Drain any body so the connection can be reused (keep-alive).
             resp.read()
             return ObjectMeta(key=key, size=size)
-        finally:
-            with suppress(OSError):
-                resp.close()
-            self._checkin(bucket, ip, conn)
-
-    def range_get(
-        self,
-        bucket: str,
-        key: str,
-        start: int,
-        end: int,
-        ip: str,
-    ) -> Iterator[bytes]:
-        """Stream the byte range [start, end] (inclusive) from *ip*.
-
-        Yields chunks of the response body. The caller is responsible for
-        writing them at the correct offset. The connection is returned to the
-        pool after the body is fully consumed.
-        """
-        range_header = f"bytes={start}-{end}"
-        status, _headers, resp, conn = self._request(
-            "GET", bucket, key, ip, extra_headers={"Range": range_header}
-        )
-        if status == 206:
-            pass
-        elif status == 200:
-            log.warning(
-                "server returned 200 (ignored Range) for %s/%s on %s; slicing", bucket, key, ip
-            )
-        else:
-            body = resp.read(2048)
-            with suppress(OSError):
-                resp.close()
-            with suppress(OSError):
-                conn.close()
-            msg = (
-                f"Range GET {bucket}/{key} bytes={start}-{end} failed: "
-                f"HTTP {status}: {body[:200]!r}"
-            )
-            raise RuntimeError(msg)
-
-        # Stream the body, then return the connection to the pool for reuse.
-        try:
-            while True:
-                chunk = resp.read(4 * 1024 * 1024)
-                if not chunk:
-                    break
-                yield chunk
         finally:
             with suppress(OSError):
                 resp.close()

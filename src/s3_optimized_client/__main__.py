@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Fast parallel downloader for S3-compatible object storage "
             "(Linode Object Storage). Resolves the endpoint to multiple IPs, "
-            "opens one TCP connection per IP, and downloads byte ranges in parallel."
+            "opens one TCP connection per IP, and downloads in parallel."
         ),
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -98,25 +98,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Tuning
     p.add_argument(
-        "--chunks", type=int, default=None, help="Override byte-range chunk count (auto by default)"
-    )
-    p.add_argument(
-        "--min-chunk-mb",
-        type=int,
-        default=4,
-        help="Minimum chunk size in MiB for auto chunking (default: 4)",
-    )
-    p.add_argument(
-        "--concurrency",
-        type=int,
-        default=None,
-        help="Parallel objects for --prefix/--all (default: number of resolved IPs)",
-    )
-    p.add_argument(
         "--connections-per-ip",
         type=int,
         default=4,
-        help="Concurrent TCP connections per IP for range downloads (default: 4)",
+        help="Concurrent TCP connections (processes) per IP (default: 4)",
     )
 
     # Debug
@@ -147,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configure_logging(args.verbose)
 
-    # --dns-only short-circuit -------------------------------------------------
+    # --dns-only short-circuit
     if args.dns_only:
         ips = resolve_endpoint(args.endpoint)
         print(f"Resolved {args.endpoint} -> {len(ips)} IP(s):")
@@ -171,8 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # Resolve endpoint to IPs. Default to IPv4 only — Docker and many
-    # networks don't route IPv6, and unreachable IPv6 IPs cause permanent
-    # chunk failures. Use --ipv6 to include AAAA records.
+    # networks don't route IPv6. Use --ipv6 to include AAAA records.
     try:
         resolved = resolve_endpoint(args.endpoint)
     except Exception as exc:  # noqa: BLE001
@@ -183,7 +167,6 @@ def main(argv: list[str] | None = None) -> int:
     else:
         ips = [r.ip for r in resolved if not r.is_ipv6]
         if not ips:
-            # No IPv4 records — fall back to whatever we have.
             ips = [r.ip for r in resolved]
     log.info("resolved %s -> %d IPs: %s", args.endpoint, len(ips), ", ".join(ips))
 
@@ -202,11 +185,8 @@ def main(argv: list[str] | None = None) -> int:
         downloader = ParallelDownloader(
             client,
             ips,
-            chunks_override=args.chunks,
-            min_chunk_mb=args.min_chunk_mb,
-            object_concurrency=args.concurrency,
-            verify_tls=not args.no_verify_tls,
             connections_per_ip=args.connections_per_ip,
+            verify_tls=not args.no_verify_tls,
         )
 
         try:
@@ -219,22 +199,10 @@ def main(argv: list[str] | None = None) -> int:
                 log.info("done: %s (%d bytes, %.2fs)", res.output_path, res.size, res.elapsed)
             elif args.prefix is not None:
                 out = Path(args.output) if args.output else Path(args.prefix)
-                results = downloader.download_prefix(args.bucket, args.prefix, out)
-                failed = [r for r in results if not r.success]
-                if failed:
-                    log.error("%d/%d objects failed", len(failed), len(results))
-                    for r in failed:
-                        log.error("  %s: %s", r.key, r.error)
-                    return 1
+                downloader.download_prefix(args.bucket, args.prefix, out)
             elif args.all:
                 out = Path(args.output) if args.output else Path(args.bucket)
-                results = downloader.download_prefix(args.bucket, "", out)
-                failed = [r for r in results if not r.success]
-                if failed:
-                    log.error("%d/%d objects failed", len(failed), len(results))
-                    for r in failed:
-                        log.error("  %s: %s", r.key, r.error)
-                    return 1
+                downloader.download_prefix(args.bucket, "", out)
         except Exception as exc:  # noqa: BLE001 - top-level error surface
             log.error("download error: %s", exc)
             if args.verbose >= 2:

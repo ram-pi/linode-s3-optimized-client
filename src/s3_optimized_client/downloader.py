@@ -1,13 +1,12 @@
 """Parallel downloader using persistent multiprocessing.
 
-For single-object downloads: uses threads with byte-range parallelism across
-all IPs (process overhead isn't worth it for one object).
+Single-object: downloads via the main process using ``get_object`` (simple,
+no range splitting — parallelism benefit is in prefix mode across many objects).
 
-For prefix/bucket downloads: spawns **persistent worker processes** —
-``connections_per_ip`` processes per resolved IP. Each process is
-single-threaded with its own GIL and its own TCP connection, downloading full
-objects sequentially. No GIL contention, no range splitting, no reassembly.
-Scales linearly with ``connections_per_ip`` until the VM NIC or CPU is saturated.
+Prefix/bucket: spawns ``connections_per_ip`` persistent worker processes per
+resolved IP. Each process is single-threaded with its own GIL and TCP
+connection, downloading full objects sequentially. No range splitting, no
+reassembly — just a simple GET → write → next object loop.
 """
 
 from __future__ import annotations
@@ -17,11 +16,9 @@ import multiprocessing
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-from .chunk_pool import Range, plan_chunks
 from .s3 import S3Client, S3Credentials
 from .stats import ProgressTracker
 
@@ -36,7 +33,6 @@ class DownloadResult:
     output_path: Path
     size: int
     elapsed: float
-    chunks: int
     success: bool
     error: str | None = None
 
@@ -61,8 +57,7 @@ def _persistent_worker(
 
     Single-threaded — no GIL contention with other connections on the same IP.
     Creates one ``S3Client`` at startup and reuses keep-alive connections.
-    Downloads full objects (no Range header, no chunk splitting) and writes
-    them sequentially to disk via ``os.write``.
+    Downloads full objects (no Range header) and writes them to disk.
 
     Multiple processes for the same IP read from the same task queue — each
     gets a different object, so all connections are busy simultaneously.
@@ -116,13 +111,9 @@ def _persistent_worker(
 class ParallelDownloader:
     """Orchestrates parallel downloads across resolved IPs.
 
-    Single-object: threads with byte-range parallelism (low overhead for one
-    object, GIL impact is small).
-
+    Single-object: simple download via ``get_object`` (no range splitting).
     Prefix/bucket: ``connections_per_ip`` persistent processes per IP, each
-    single-threaded with its own GIL and TCP connection. Scales linearly with
-    ``connections_per_ip`` — no GIL contention between connections on the same
-    IP.
+    single-threaded with its own GIL and TCP connection.
     """
 
     def __init__(
@@ -130,22 +121,16 @@ class ParallelDownloader:
         client: S3Client,
         ips: list[str],
         *,
-        chunks_override: int | None = None,
-        min_chunk_mb: int = 4,
-        object_concurrency: int | None = None,
-        verify_tls: bool = True,
         connections_per_ip: int = 4,
+        verify_tls: bool = True,
     ) -> None:
         self._client = client
         self._ips = ips
-        self._chunks_override = chunks_override
-        self._min_chunk_mb = min_chunk_mb
-        self._object_concurrency = max(1, object_concurrency or len(ips))
         self._verify_tls = verify_tls
         self._connections_per_ip = max(1, connections_per_ip)
         self._mp_ctx = multiprocessing.get_context("fork")
 
-    # -- Single object (threads + ranges) ---------------------------------
+    # -- Single object ----------------------------------------------------
 
     def download_object(
         self,
@@ -155,89 +140,66 @@ class ParallelDownloader:
         *,
         tracker: ProgressTracker | None = None,
     ) -> DownloadResult:
-        """Download *bucket*/*key* to *output_path* using parallel threads.
+        """Download *bucket*/*key* to *output_path*.
 
-        Uses threads with byte-range parallelism across all IPs. For a single
-        object the GIL impact is small and process spawning overhead isn't
-        worth it.
+        Simple full-object download using the first IP. For single objects the
+        overhead of spawning processes isn't worth it — the parallelism benefit
+        is in prefix mode across many objects.
         """
         start = time.monotonic()
         meta = self._client.head_object(bucket, key, ip=self._ips[0])
         total = meta.size
-        if total == 0:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.touch()
-            elapsed = time.monotonic() - start
-            return DownloadResult(key, output_path, 0, elapsed, 0, True)
-
-        ranges = plan_chunks(
-            total,
-            self._ips,
-            chunks_override=self._chunks_override,
-            min_chunk_mb=self._min_chunk_mb,
-            target_chunks=self._connections_per_ip * len(self._ips),
-        )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        try:
-            os.ftruncate(fd, total)
 
-            own_tracker = tracker is None
-            if own_tracker:
-                tracker = ProgressTracker(total, ip_label=f"{bucket}/{key}")
-                tracker.start()
+        own_tracker = tracker is None
+        if own_tracker:
+            tracker = ProgressTracker(total, ip_label=f"{bucket}/{key}")
+            tracker.start()
 
-            errors: list[str] = []
-            err_lock = threading.Lock()
-
-            def _worker(rng: Range) -> None:
-                try:
-                    offset = rng.start
-                    for buf in self._client.range_get(bucket, key, rng.start, rng.end, rng.ip):
-                        view = memoryview(buf)
-                        written = 0
-                        while written < len(buf):
-                            n = os.pwrite(fd, view[written:], offset + written)
-                            written += n
-                        offset += len(buf)
-                        if tracker is not None:
-                            tracker.add_bytes(rng.ip, len(buf))
-                    if tracker is not None:
-                        tracker.add_chunk(rng.ip)
-                except Exception as exc:  # noqa: BLE001
-                    with err_lock:
-                        errors.append(f"chunk {rng.index} ({rng.ip}): {exc}")
-                    log.exception("chunk %d failed", rng.index)
-
-            n_workers = min(len(ranges), self._connections_per_ip * len(self._ips))
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = [pool.submit(_worker, r) for r in ranges]
-                for fut in as_completed(futures):
-                    fut.result()
-
-            os.fsync(fd)
-
+        if total == 0:
+            output_path.touch()
+            elapsed = time.monotonic() - start
             if own_tracker and tracker is not None:
-                elapsed = tracker.stop()
-                tracker.print_summary(title=f"Summary: {bucket}/{key}", elapsed=elapsed)
-            elif tracker is not None:
-                elapsed = time.monotonic() - start
+                tracker.stop()
+            return DownloadResult(key, output_path, 0, elapsed, True)
+
+        ip = self._ips[0]
+        fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        error: str | None = None
+        try:
+            for buf in self._client.get_object(bucket, key, ip):
+                view = memoryview(buf)
+                written = 0
+                while written < len(buf):
+                    n = os.write(fd, view[written:])
+                    written += n
+                if tracker is not None:
+                    tracker.add_bytes(ip, len(buf))
+            if tracker is not None:
+                tracker.add_chunk(ip)
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+            log.exception("download of %s/%s failed", bucket, key)
         finally:
             os.close(fd)
 
-        success = not errors
+        if own_tracker and tracker is not None:
+            elapsed = tracker.stop()
+            tracker.print_summary(title=f"Summary: {bucket}/{key}", elapsed=elapsed)
+        else:
+            elapsed = time.monotonic() - start
+
         return DownloadResult(
             key=key,
             output_path=output_path,
             size=total,
             elapsed=elapsed,
-            chunks=len(ranges),
-            success=success,
-            error="; ".join(errors) if errors else None,
+            success=error is None,
+            error=error,
         )
 
-    # -- Prefix / bucket (persistent processes, no GIL contention) -------
+    # -- Prefix / bucket --------------------------------------------------
 
     def download_prefix(
         self,
@@ -250,8 +212,7 @@ class ParallelDownloader:
         Spawns ``connections_per_ip`` persistent processes per IP. Each process
         is single-threaded with its own GIL and TCP connection, downloading
         full objects sequentially. Multiple processes for the same IP read
-        from the same task queue — each gets a different object, so all
-        connections stay busy. No GIL contention, no range splitting.
+        from the same task queue — each gets a different object.
         """
         results: list[DownloadResult] = []
         metas = list(self._client.list_objects(bucket, prefix=prefix))
@@ -273,8 +234,7 @@ class ParallelDownloader:
         )
         tracker.start()
 
-        # Shared memory counters — one slot per IP (shared by all processes
-        # for that IP).
+        # Shared memory counters — one slot per IP (shared by all processes for that IP).
         shared_bytes = self._mp_ctx.Array("q", n_ips)
         shared_chunks = self._mp_ctx.Array("i", n_ips)
 
@@ -362,7 +322,7 @@ class ParallelDownloader:
         elapsed = tracker.stop()
         ip_bytes = {self._ips[i]: int(shared_bytes[i]) for i in range(n_ips)}
         ip_chunks = {self._ips[i]: int(shared_chunks[i]) for i in range(n_ips)}
-        tracker.print_summary_from_shared(
+        tracker.print_summary(
             title=f"Summary: {bucket}/{prefix or '(root)'}",
             object_label=f"{completed}/{total_objects} objects, {_human_bytes(final_bytes)}",
             elapsed=elapsed,

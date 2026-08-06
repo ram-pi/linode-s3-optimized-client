@@ -1,12 +1,12 @@
 """Stats: live progress bar + final per-IP summary.
 
 Uses ``rich`` for both the in-place progress display and the post-download
-summary table. The live progress is thread-safe: workers call
-:meth:`ProgressTracker.add_bytes` from multiple threads.
+summary table.
 """
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -44,14 +44,7 @@ class IPStats:
 
 
 class ProgressTracker:
-    """Thread-safe accumulator for live progress + per-IP stats.
-
-    Args:
-        total: total bytes to download for the current object.
-        ip_label: short label for the rich task description (e.g. the bucket/key
-            or ``"bucket: 3 objects"`` for multi-object mode).
-        console: optional rich console (default: creates one).
-    """
+    """Thread-safe accumulator for live progress + per-IP stats."""
 
     def __init__(
         self,
@@ -66,11 +59,7 @@ class ProgressTracker:
         self._lock = threading.Lock()
         self._per_ip: dict[str, IPStats] = {}
         self._start = time.monotonic()
-        # When stdout is not a TTY (piped/redirected), disable the live bar —
-        # rich's cursor-control sequences produce no visible output when piped
-        # and only clutter the stream. The final summary table still prints.
-        import sys
-
+        # Disable live bar when stdout is not a TTY (piped/redirected).
         if show_live and not sys.stdout.isatty():
             show_live = False
         self._console = console or Console()
@@ -98,26 +87,25 @@ class ProgressTracker:
         self._last_print = 0.0
         self._last_printed_bytes = 0
 
-    # -- Live updates ------------------------------------------------------
-
     def add_bytes(self, ip: str, n: int) -> None:
-        """Record *n* bytes downloaded from *ip* and refresh the live bar."""
+        """Record *n* bytes downloaded from *ip* (single-object mode)."""
         with self._lock:
             self._downloaded += n
             stats = self._per_ip.setdefault(ip, IPStats(start=time.monotonic()))
             stats.bytes_downloaded += n
-            stats.chunks += 0  # chunks counted separately via add_chunk
         if self._show_live and self._progress is not None:
             self._progress.update(self._task, advance=n)
         else:
             self._maybe_print_progress()
 
-    def advance(self, n: int) -> None:
-        """Advance the total downloaded counter by *n* bytes (no per-IP breakdown).
+    def add_chunk(self, ip: str) -> None:
+        """Mark that a chunk completed on *ip*."""
+        with self._lock:
+            stats = self._per_ip.setdefault(ip, IPStats(start=time.monotonic()))
+            stats.chunks += 1
 
-        Used by the multiprocessing polling thread that reads shared counters
-        and doesn't have per-chunk IP information.
-        """
+    def advance(self, n: int) -> None:
+        """Advance the total counter by *n* bytes (multiprocessing polling)."""
         with self._lock:
             self._downloaded += n
         if self._show_live and self._progress is not None:
@@ -144,14 +132,6 @@ class ProgressTracker:
             markup=False,
         )
 
-    def add_chunk(self, ip: str) -> None:
-        """Mark that a chunk completed on *ip*."""
-        with self._lock:
-            stats = self._per_ip.setdefault(ip, IPStats(start=time.monotonic()))
-            stats.chunks += 1
-
-    # -- Lifecycle --------------------------------------------------------
-
     def start(self) -> None:
         if self._show_live and self._progress is not None:
             self._progress.start()
@@ -166,24 +146,7 @@ class ProgressTracker:
                 stats.elapsed = time.monotonic() - stats.start
         return elapsed
 
-    # -- Final summary ----------------------------------------------------
-
     def print_summary(
-        self,
-        *,
-        title: str = "Download summary",
-        elapsed: float | None = None,
-        object_label: str | None = None,
-    ) -> None:
-        """Print the final summary table to the console."""
-        elapsed = elapsed if elapsed is not None else (time.monotonic() - self._start)
-        with self._lock:
-            total_bytes = self._downloaded
-            per_ip = dict(self._per_ip)
-
-        self._print_table(title, elapsed, object_label, total_bytes, per_ip)
-
-    def print_summary_from_shared(
         self,
         *,
         title: str = "Download summary",
@@ -192,14 +155,18 @@ class ProgressTracker:
         ip_bytes: dict[str, int] | None = None,
         ip_chunks: dict[str, int] | None = None,
     ) -> None:
-        """Print summary from per-IP data collected from shared memory.
+        """Print the final summary table.
 
-        Used in multiprocessing mode where the tracker doesn't have live
-        per-IP stats (workers update shared arrays, not the tracker).
+        Args:
+            ip_bytes: per-IP byte counts (from shared memory in multiprocessing
+                mode). When ``None``, uses the tracker's internal per-IP stats.
+            ip_chunks: per-IP chunk counts (same as above).
         """
         elapsed = elapsed if elapsed is not None else (time.monotonic() - self._start)
         with self._lock:
             total_bytes = self._downloaded
+
+        # Build per-IP stats from either shared memory or internal tracking.
         per_ip: dict[str, IPStats] = {}
         if ip_bytes:
             for ip, n in ip_bytes.items():
@@ -208,17 +175,10 @@ class ProgressTracker:
                     chunks=(ip_chunks or {}).get(ip, 0),
                     elapsed=elapsed,
                 )
-        self._print_table(title, elapsed, object_label, total_bytes, per_ip)
+        else:
+            with self._lock:
+                per_ip = dict(self._per_ip)
 
-    def _print_table(
-        self,
-        title: str,
-        elapsed: float,
-        object_label: str | None,
-        total_bytes: int,
-        per_ip: dict[str, IPStats],
-    ) -> None:
-        """Internal: render the summary table + aggregate stats."""
         table = Table(title=title, show_header=True, header_style="bold green")
         table.add_column("IP", style="cyan", no_wrap=True)
         table.add_column("Chunks", justify="right")
@@ -226,12 +186,11 @@ class ProgressTracker:
         table.add_column("Avg speed", justify="right")
 
         for ip, stats in sorted(per_ip.items()):
-            speed = stats.avg_speed
             table.add_row(
                 ip,
                 str(stats.chunks),
                 _human_bytes(stats.bytes_downloaded),
-                _human_speed(speed),
+                _human_speed(stats.avg_speed),
             )
 
         self._console.print()
@@ -239,7 +198,6 @@ class ProgressTracker:
             self._console.print(f"[bold]{object_label}[/bold]")
         self._console.print(table)
 
-        # Aggregate row.
         agg = Table(show_header=False, box=None, padding=(0, 0))
         agg.add_column("k", style="bold")
         agg.add_column("v")
@@ -249,11 +207,6 @@ class ProgressTracker:
         agg.add_row("IPs used", str(len(per_ip)))
         self._console.print(agg)
         self._console.print()
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _human_bytes(n: int) -> str:
