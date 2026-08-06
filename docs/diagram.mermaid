@@ -1,0 +1,45 @@
+flowchart TB
+    subgraph Main["Main process"]
+        DNS["DNS lookup\nendpoint -> all IPs"]
+        LIST["List objects\nvia boto3"]
+        DIST["Distribute objects\nround-robin to\nper-IP task queues"]
+        POLL["Polling thread\nreads shared counters\nevery 0.5s"]
+        PROG["Live progress bar\nMB/s, ETA"]
+        SUMMARY["Per-IP summary table\nat completion"]
+    end
+
+    DNS --> LIST
+    LIST --> DIST
+
+    subgraph IP1["IP 1"]
+        Q1["Task queue"]
+        Q1 --> W1A["Process 1\nGET -> write"]
+        Q1 --> W1B["Process 2\nGET -> write"]
+        Q1 --> W1N["Process N\nGET -> write"]
+    end
+
+    subgraph IP2["IP 2"]
+        Q2["Task queue"]
+        Q2 --> W2A["Process 1\nGET -> write"]
+        Q2 --> W2B["Process 2\nGET -> write"]
+        Q2 --> W2N["Process N\nGET -> write"]
+    end
+
+    subgraph IPN["IP N"]
+        QN["Task queue"]
+        QN --> WNA["Process 1\nGET -> write"]
+        QN --> WNN["Process N\nGET -> write"]
+    end
+
+    DIST --> Q1
+    DIST --> Q2
+    DIST --> QN
+
+    W1A -->|"shared memory"| POLL
+    W1B -->|"shared memory"| POLL
+    W2A -->|"shared memory"| POLL
+    W2B -->|"shared memory"| POLL
+    WNA -->|"shared memory"| POLL
+
+    POLL --> PROG
+    POLL --> SUMMARY

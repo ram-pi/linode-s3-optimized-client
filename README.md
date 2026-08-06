@@ -104,6 +104,7 @@ docker run --rm \
 --prefix PREFIX          Download all objects under a prefix
 --all                    Download the entire bucket
 --output PATH            Output file (--key) or directory (--prefix/--all)
+--size-only              Calculate and print total size without downloading
 --connections-per-ip N   Concurrent processes (TCP connections) per IP (default: 4)
 --dns-only               Resolve endpoint to IPs and exit
 --ipv6                   Include IPv6 addresses (default: IPv4 only)
@@ -113,38 +114,7 @@ docker run --rm \
 
 ## How it works
 
-```mermaid
-flowchart TB
-    subgraph Main["Main process (orchestrator)"]
-        DNS["DNS lookup\nresolve endpoint to all IPs"]
-        LIST["List objects\nvia boto3"]
-        DIST["Distribute objects\nround-robin to per-IP task queues"]
-        POLL["Polling thread\nreads shared counters\nevery 0.5s"]
-    end
-
-    subgraph Workers["Worker processes (connections_per_ip per IP)"]
-        subgraph IP1["IP 1 (e.g. 172.237.102.1)"]
-            W1A["Process 1\nGET object -> os.write"]
-            W1B["Process 2\nGET object -> os.write"]
-            W1C["Process N\nGET object -> os.write"]
-        end
-        subgraph IP2["IP 2 (e.g. 172.237.102.2)"]
-            W2A["Process 1\nGET object -> os.write"]
-            W2B["Process 2\nGET object -> os.write"]
-        end
-        subgraph IPN["IP N"]
-            WNA["Process 1\nGET object -> os.write"]
-        end
-    end
-
-    DNS --> LIST --> DIST
-    DIST -->|task queue| IP1
-    DIST -->|task queue| IP2
-    DIST -->|task queue| IPN
-    W1A & W1B & W1C & W2A & W2B & WNA -->|shared memory\nArray of byte counters| POLL
-    POLL -->|advance progress| PROG["Live progress bar\nMB/s, ETA"]
-    W1A & W1B & W1C & W2A & W2B & WNA -->|result queue| DONE["Collect results\nPrint summary"]
-```
+See [`docs/diagram.mermaid`](docs/diagram.mermaid) for visual flow diagrams.
 
 1. **DNS lookup** — resolves the endpoint hostname to all public IPs via `socket.getaddrinfo`.
 2. **List objects** — uses boto3 to list all objects under the prefix.

@@ -40,6 +40,7 @@ from . import __version__
 from .dns import resolve_endpoint
 from .downloader import ParallelDownloader
 from .s3 import S3Client, S3Credentials
+from .stats import _human_bytes
 
 log = logging.getLogger("s3_optimized_client")
 
@@ -90,6 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--key", help="Download a single object key")
     mode.add_argument("--prefix", help="Download all objects under a prefix (folder)")
     mode.add_argument("--all", action="store_true", help="Download the entire bucket")
+
+    # Info-only (no download)
+    p.add_argument(
+        "--size-only",
+        action="store_true",
+        help="Calculate and print the total size of the bucket/prefix/key without downloading",
+    )
 
     # Output
     p.add_argument(
@@ -190,6 +198,28 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         try:
+            if args.size_only:
+                if args.key:
+                    meta = client.head_object(args.bucket, args.key, ip=ips[0])
+                    size_h = _human_bytes(meta.size)
+                    print(f"{args.bucket}/{args.key}: {size_h} ({meta.size} bytes)")
+                else:
+                    prefix = args.prefix or ""
+                    metas = list(client.list_objects(args.bucket, prefix=prefix))
+                    if not metas:
+                        if prefix:
+                            print(f"No objects found under prefix {prefix!r}")
+                        else:
+                            print("Bucket is empty")
+                        return 0
+                    total = sum(m.size for m in metas)
+                    label = f"prefix {prefix!r}" if prefix else "bucket"
+                    size_h = _human_bytes(total)
+                    print(
+                        f"{args.bucket} ({label}): {size_h} ({total} bytes, {len(metas)} objects)"
+                    )
+                return 0
+
             if args.key:
                 out = Path(args.output) if args.output else Path(args.key).name
                 res = downloader.download_object(args.bucket, args.key, out)
